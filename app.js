@@ -169,6 +169,8 @@ function FinanzasSeba() {
   const [history, setHistory] = useState([]);
   const [sharedExpenses, setSharedExpenses] = useState([]);
   const [settlements, setSettlements] = useState([]);
+  const [sharedHistory, setSharedHistory] = useState([]);
+  const [expandedSettlement, setExpandedSettlement] = useState(null);
   const [monthLabel, setMonthLabel] = useState(currentMonthLabel());
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState("");
@@ -198,6 +200,10 @@ function FinanzasSeba() {
           if (shared.settlements) setSettlements(shared.settlements);
         }
       } catch (e) { console.error(e); }
+      try {
+        const sh = await kvGet("sharedHistory");
+        if (sh) setSharedHistory(sh);
+      } catch (e) { console.error(e); }
       setLoading(false);
     })();
   }, []);
@@ -212,7 +218,7 @@ function FinanzasSeba() {
   const runwayMonths = totalGastos > 0 ? reserveTotal / totalGastos : 0;
 
   const sharedBalance = useMemo(() => {
-    const fromExpenses = sharedExpenses.reduce((s, e2) => s + (e2.paidBy === "seba" ? num(e2.amount) / 2 : -num(e2.amount) / 2), 0);
+    const fromExpenses = sharedExpenses.reduce((s, e2) => s + (e2.paidBy === "seba" ? Math.round(num(e2.amount) / 2) : -Math.round(num(e2.amount) / 2)), 0);
     const fromSettlements = settlements.reduce((s, st) => s + (st.direction === "carla_to_seba" ? -num(st.amount) : num(st.amount)), 0);
     return fromExpenses + fromSettlements;
   }, [sharedExpenses, settlements]);
@@ -244,11 +250,34 @@ function FinanzasSeba() {
   const deleteSharedExpense = (id) => setSharedExpenses(sharedExpenses.filter((x) => x.id !== id));
   const addSharedExpense = () => setSharedExpenses([...sharedExpenses, { id: uid(), name: "", amount: "", paidBy: "seba" }]);
 
-  const addSettlement = (direction) => {
-    const amountStr = String(Math.round(Math.abs(sharedBalance)));
-    setSettlements([...settlements, { id: uid(), direction, amount: amountStr }]);
+  const settleSharedBalance = async (direction) => {
+    const amount = Math.round(Math.abs(sharedBalance));
+    const entry = {
+      id: uid(),
+      date: new Date().toISOString().slice(0, 10),
+      label: currentMonthLabel(),
+      direction,
+      amount,
+      expenses: sharedExpenses,
+    };
+    const nextHistory = [...sharedHistory, entry];
+    setSharedHistory(nextHistory);
+    setSharedExpenses([]);
+    setSettlements([]);
+    setSharedSaveStatus("Guardando...");
+    const ok1 = await persist("sharedHistory", nextHistory);
+    const ok2 = await persist("shared", { sharedExpenses: [], settlements: [] });
+    const ok = ok1 && ok2;
+    setSharedSaved(ok);
+    setSharedSaveStatus(ok ? "✓ Liquidado y guardado" : "✕ Error al guardar, intenta de nuevo");
+    setTimeout(() => { setSharedSaved(false); setSharedSaveStatus(""); }, 3000);
   };
-  const deleteSettlement = (id) => setSettlements(settlements.filter((s) => s.id !== id));
+
+  const renameSettlement = async (id, newLabel) => {
+    const next = sharedHistory.map((h) => (h.id === id ? { ...h, label: newLabel } : h));
+    setSharedHistory(next);
+    await persist("sharedHistory", next);
+  };
 
   const saveSharedModule = async () => {
     setSharedSaveStatus("Guardando...");
@@ -356,23 +385,49 @@ function FinanzasSeba() {
     sharedExpenses.length === 0 ? e("p", { className: "text-xs opacity-70 italic mb-2" }, "Sin gastos compartidos registrados todavía.") : null,
     sharedExpenses.map((x) => e(SharedExpenseRow, { key: x.id, item: x, onChange: updateSharedExpense, onDelete: deleteSharedExpense })),
     e("button", { onClick: addSharedExpense, className: "text-xs mt-2 underline opacity-90" }, "+ agregar gasto compartido"),
-    settlements.length > 0 ? e("div", { className: "mt-3 pt-3 border-t border-rose-200" },
-      e("p", { className: "text-[11px] opacity-70 mb-1" }, "Pagos registrados"),
-      settlements.map((st) => e("div", { key: st.id, className: "flex justify-between text-xs py-1" },
-        e("span", { className: "opacity-80" }, st.direction === "carla_to_seba" ? "Carla → Seba" : "Seba → Carla"),
-        e("div", { className: "flex items-center gap-2" },
-          e("span", null, `$${fmt(num(st.amount))}`),
-          e("button", { onClick: () => deleteSettlement(st.id), className: "opacity-60 hover:opacity-100" }, "×")
-        )
-      ))
-    ) : null,
     sharedBalance !== 0 ? e("div", { className: "mt-3" },
-      e(PillButton, { onClick: () => addSettlement(sharedBalance > 0 ? "carla_to_seba" : "seba_to_carla"), variant: "ghost" },
+      e(PillButton, {
+        onClick: () => {
+          const who = sharedBalance > 0 ? "Carla me transfirió" : "le transferí a Carla";
+          if (window.confirm(`Confirmas que ${who} $${fmt(Math.abs(sharedBalance))}?\n\nEsto va a cerrar y archivar los ${sharedExpenses.length} gastos actuales, dejando el saldo en $0.`)) {
+            settleSharedBalance(sharedBalance > 0 ? "carla_to_seba" : "seba_to_carla");
+          }
+        },
+        variant: "ghost",
+      },
         `Registrar que ${sharedBalance > 0 ? "Carla me transfirió" : "le transferí a Carla"} $${fmt(Math.abs(sharedBalance))}`)
     ) : null,
     e("div", { className: "mt-3" }, e(PillButton, { onClick: saveSharedModule, variant: sharedSaved ? "success" : "primary" }, sharedSaveStatus || "Guardar cambios")),
     e("p", { className: "text-[10px] opacity-60 mt-3 leading-relaxed" }, "Este saldo es independiente de los gastos fijos de Seba — no se resta de ningún patrimonio, solo lleva la cuenta entre ustedes dos.")
   );
+
+  const settlementHistoryCard = sharedHistory.length > 0 ? e(SectionCard, { key: "liquidaciones", theme: "rose", title: "Historial de liquidaciones", subtitle: "Cada vez que se cierra el saldo, queda un registro aquí" },
+    [...sharedHistory].reverse().map((h) => {
+      const isOpen = expandedSettlement === h.id;
+      return e("div", { key: h.id, className: "border-b border-rose-200 last:border-0" },
+        e("button", { onClick: () => setExpandedSettlement(isOpen ? null : h.id), className: "w-full flex items-center justify-between py-2 text-sm text-left" },
+          e("span", { className: "flex items-center gap-1" }, e("span", { className: "text-xs opacity-60" }, isOpen ? "▾" : "▸"), h.label),
+          e("div", { className: "text-right text-xs opacity-80" },
+            e("div", null, h.direction === "carla_to_seba" ? "Carla → Seba" : "Seba → Carla"),
+            e("div", null, `$${fmt(h.amount)}`)
+          )
+        ),
+        isOpen ? e("div", { className: "pb-3 pl-4" },
+          e("label", { className: "flex items-center gap-2 text-[11px] opacity-70 mb-2" }, "renombrar",
+            e("input", {
+              className: "bg-white/50 rounded px-2 py-1 text-xs outline-none focus:ring-1 focus:ring-orange-400",
+              defaultValue: h.label,
+              onBlur: (ev) => { if (ev.target.value && ev.target.value !== h.label) renameSettlement(h.id, ev.target.value); },
+            })
+          ),
+          (h.expenses || []).map((x) => e("div", { key: x.id, className: "flex justify-between text-xs py-1" },
+            e("span", { className: "opacity-70" }, `${x.name || "(sin descripción)"} · ${x.paidBy === "seba" ? "Seba" : "Carla"}`),
+            e("span", null, `$${fmt(num(x.amount))}`)
+          ))
+        ) : null
+      );
+    })
+  ) : null;
 
   const historyCard = (viewAs === "seba" && history.length > 0) ? e(SectionCard, { key: "meses", theme: "light", title: "Meses cerrados", subtitle: "Toca un mes para ver el detalle" },
     [...history].reverse().map((h) => {
@@ -417,6 +472,7 @@ function FinanzasSeba() {
     e("div", { className: "h-4 mb-2" }, status ? e("span", { className: "text-[11px] text-emerald-600 font-medium" }, status) : null),
     sebaSections,
     sharedCard,
+    settlementHistoryCard,
     historyCard,
     chartCard,
     e("p", { className: "text-[10px] text-stone-400 text-center mt-6 leading-relaxed" },
